@@ -1,4 +1,4 @@
-# QuickPrint PDF Viewer
+# Quick-Print PDF Viewer
 
 가볍게 PDF 내용을 확인하고, Enter 한 번으로 현재 페이지(만)를 바로 인쇄할 수 있는 Windows용 프로그램입니다.
 
