@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build/output artifacts
+build/
+dist/
+
+# Windows shortcut files
+*.lnk
