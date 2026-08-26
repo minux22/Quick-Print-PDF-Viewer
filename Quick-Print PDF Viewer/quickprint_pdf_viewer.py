@@ -1,5 +1,5 @@
 """
-QuickPrint PDF Viewer
+Quick-Print PDF Viewer
 - PDF를 열면 현재 쪽이 창 크기에 맞춰(페이지 맞춤) 표시됨 — 이 상태가 줌아웃 최대치
 - Ctrl + 마우스 휠로 줌인/줌아웃 (올리면 확대, 내리면 축소, 페이지 맞춤 아래로는 더 축소 안 됨)
 - 확대된 상태: 클릭 후 드래그하면 페이지 안을 이동(패닝, 커서가 움켜쥔 손 모양으로 바뀜),
@@ -25,11 +25,12 @@ QuickPrint PDF Viewer
 """
 
 import sys
+import os
 import pymupdf as fitz  # PyMuPDF (오픈소스, MuPDF 기반)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QPushButton, QFileDialog, QSplitter, QTreeWidget, QTreeWidgetItem,
-    QScrollArea, QLineEdit, QShortcut
+    QScrollArea, QLineEdit, QShortcut, QScrollBar
 )
 from PyQt5.QtGui import (
     QImage, QPixmap, QIntValidator, QKeySequence, QColor, QPainter, QPolygon,
@@ -40,6 +41,7 @@ from PyQt5.QtCore import Qt, QSettings, QTimer, QPoint, QRectF
 MIN_ZOOM = 1.0   # 1.0 = 페이지 맞춤 (더 이상 축소 불가)
 MAX_ZOOM = 5.0
 ZOOM_STEP = 1.15
+APP_TITLE = "Quick-Print PDF Viewer"
 
 
 class PannableLabel(QLabel):
@@ -50,6 +52,7 @@ class PannableLabel(QLabel):
         self.scroll_area = scroll_area
         self._on_click = on_click
         self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background: transparent;")  # 이미지 없을 때 흰 조각이 남지 않도록
         self._dragging = False
         self._drag_start = None
         self._h_start = 0
@@ -114,7 +117,49 @@ class PageScrollArea(QScrollArea):
         self._on_wheel_page = on_wheel_page
         self.setWidgetResizable(False)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background-color: #757575; border: none;")
+        self.setStyleSheet("""
+            QScrollArea { background-color: #757575; border: none; }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 130);
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 190);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(255, 255, 255, 130);
+                border-radius: 4px;
+                min-width: 24px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(255, 255, 255, 190);
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                border: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
+        """)
 
         self.label = PannableLabel(self, on_click=on_page_click)
         self.setWidget(self.label)
@@ -172,7 +217,7 @@ class PageNumberInput(QLineEdit):
 class PDFClickPrinter(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("QuickPrint PDF Viewer")
+        self.setWindowTitle(APP_TITLE)
         self.doc = None
         self.current_page = 0
         self._row_anchor = 0  # 여러 페이지가 나열될 때 줄의 시작 페이지(클릭 선택과 별개로 유지)
@@ -196,18 +241,28 @@ class PDFClickPrinter(QMainWindow):
 
         central = QWidget()
         main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
 
-        # 상단 바
+        # 상단 바 (얇게: 여백/버튼 크기 축소)
         top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(6)
+
+        compact_btn_style = "QPushButton { padding: 2px 8px; }"
+
         open_btn = QPushButton("PDF 열기")
+        open_btn.setStyleSheet(compact_btn_style)
         open_btn.clicked.connect(self.open_pdf)
         top_bar.addWidget(open_btn)
 
         self.prev_btn = QPushButton("◀ 이전")
+        self.prev_btn.setStyleSheet(compact_btn_style)
         self.prev_btn.clicked.connect(self.prev_page)
         top_bar.addWidget(self.prev_btn)
 
         self.next_btn = QPushButton("다음 ▶")
+        self.next_btn.setStyleSheet(compact_btn_style)
         self.next_btn.clicked.connect(self.next_page)
         top_bar.addWidget(self.next_btn)
 
@@ -215,6 +270,7 @@ class PDFClickPrinter(QMainWindow):
         self.page_input = PageNumberInput()
         self.page_input.setValidator(QIntValidator(1, 999999, self))
         self.page_input.setFixedWidth(60)
+        self.page_input.setStyleSheet("padding: 2px;")
         # 이 칸에서 Enter를 누르면 이동만 하고, 인쇄로 이어지지 않도록 이 위젯이 이벤트를 직접 처리
         self.page_input.returnPressed.connect(self.go_to_page_from_input)
         top_bar.addWidget(self.page_input)
@@ -222,7 +278,10 @@ class PDFClickPrinter(QMainWindow):
         self.status_label = QLabel("PDF를 열어주세요")
         top_bar.addWidget(self.status_label)
         top_bar.addStretch()
-        main_layout.addLayout(top_bar)
+        top_bar_widget = QWidget()
+        top_bar_widget.setLayout(top_bar)
+        top_bar_widget.setMaximumHeight(30)
+        main_layout.addWidget(top_bar_widget)
 
         # 왼쪽: 북마크(목차) 목록 / 오른쪽: 페이지 뷰
         self.splitter = QSplitter(Qt.Horizontal)
@@ -235,7 +294,44 @@ class PDFClickPrinter(QMainWindow):
         self.splitter.addWidget(self.bookmark_tree)
 
         self.page_area = PageScrollArea(self.on_wheel_zoom, self.on_wheel_page, on_page_click=self.on_page_click)
-        self.splitter.addWidget(self.page_area)
+
+        # 오른쪽: 페이지 뷰 + 문서 전체 진행 표시줄(항상 보임, 드래그하면 해당 쪽으로 이동)
+        page_container = QWidget()
+        page_container_layout = QHBoxLayout(page_container)
+        page_container_layout.setContentsMargins(0, 0, 0, 0)
+        page_container_layout.setSpacing(0)
+        page_container_layout.addWidget(self.page_area, stretch=1)
+
+        self.page_progress_bar = QScrollBar(Qt.Vertical)
+        self.page_progress_bar.setFixedWidth(10)
+        self.page_progress_bar.setStyleSheet("""
+            QScrollBar:vertical {
+                background: #45494e;
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 130);
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 190);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+        """)
+        self.page_progress_bar.setRange(0, 0)
+        self.page_progress_bar.setEnabled(False)
+        self.page_progress_bar.valueChanged.connect(self.on_progress_bar_changed)
+        page_container_layout.addWidget(self.page_progress_bar)
+
+        self.splitter.addWidget(page_container)
 
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -330,6 +426,7 @@ class PDFClickPrinter(QMainWindow):
         self._row_anchor = 0
         self.zoom = MIN_ZOOM
         self.set_nav_enabled(True)
+        self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
         self.load_bookmarks()
         # 북마크 패널이 새로 나타나거나 사라지면서 스플리터 레이아웃이 바뀔 수 있으므로,
         # 그 레이아웃이 확정된 뒤에 렌더링해야 뷰 폭을 정확히 계산해 스크롤이 생기지 않는다.
@@ -411,7 +508,7 @@ class PDFClickPrinter(QMainWindow):
 
             # 페이지들을 담을 실제 여백(margin)을 미리 확보해서, 합성 이미지가 뷰 영역을
             # 절대 넘지 않도록 한다 — 넘치면 스크롤 가능 상태로 오인되어 휠/클릭 동작이 꼬인다.
-            margin = 14
+            margin = 9
             avail_h = max(vh - margin * 2, 10)
             avail_w = max(vw - margin * 2, 10)
             scale = avail_h / max(anchor_h_pt, 0.01)
@@ -425,7 +522,7 @@ class PDFClickPrinter(QMainWindow):
                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
                 self._page_regions = [(self.current_page, 0, img.width())]
             else:
-                gap = 14
+                gap = 10
                 shown = []  # (page_idx, QImage, disp_w)
                 total_w = 0
                 idx = self._row_anchor
@@ -501,6 +598,32 @@ class PDFClickPrinter(QMainWindow):
         self.status_label.setText(
             f"{self.current_page + 1} / {len(self.doc)}쪽 · {zoom_pct}% — Enter를 누르면 현재 페이지가 인쇄됩니다"
         )
+        self._sync_progress_bar()
+
+    def _sync_progress_bar(self):
+        """오른쪽 진행 표시줄을 현재 문서/쪽 상태와 맞춘다 (프로그램에 의한 갱신이라 신호는 잠시 막음)."""
+        self.page_progress_bar.blockSignals(True)
+        if not self.doc or len(self.doc) <= 1:
+            self.page_progress_bar.setRange(0, 0)
+            self.page_progress_bar.setEnabled(False)
+        else:
+            self.page_progress_bar.setRange(1, len(self.doc))
+            self.page_progress_bar.setPageStep(1)
+            self.page_progress_bar.setValue(self.current_page + 1)
+            self.page_progress_bar.setEnabled(True)
+        self.page_progress_bar.blockSignals(False)
+
+    def on_progress_bar_changed(self, value: int):
+        # 사용자가 오른쪽 진행 표시줄을 드래그/클릭했을 때 — 해당 쪽으로 바로 이동
+        if not self.doc:
+            return
+        target = value - 1
+        if target == self.current_page:
+            return
+        self.current_page = target
+        self._row_anchor = target
+        self.zoom = MIN_ZOOM
+        self.render_current_page()
 
     def on_page_click(self, x: int, y: int):
         # 여러 페이지가 나열된 상태에서 클릭한 위치가 어느 페이지인지 찾아 선택(=현재 페이지)을 바꾼다.
