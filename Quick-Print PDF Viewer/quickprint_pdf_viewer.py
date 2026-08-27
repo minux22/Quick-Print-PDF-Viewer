@@ -635,10 +635,8 @@ class PDFClickPrinter(QMainWindow):
         self.zoom = MIN_ZOOM
         self.set_nav_enabled(True)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
-        self.bookmark_toggle_btn.show()
-        self.bookmark_toggle_btn.setText("‹")
+        self.load_bookmarks()  # 북마크 유무에 따라 토글 버튼 표시 여부까지 여기서 결정됨
         self._position_bookmark_toggle()
-        self.load_bookmarks()
         # 북마크 패널이 새로 나타나거나 사라지면서 스플리터 레이아웃이 바뀔 수 있으므로,
         # 그 레이아웃이 확정된 뒤에 렌더링해야 뷰 폭을 정확히 계산해 스크롤이 생기지 않는다.
         QTimer.singleShot(0, self.render_current_page)
@@ -648,7 +646,12 @@ class PDFClickPrinter(QMainWindow):
         toc = self.doc.get_toc()  # [[level, title, page_number], ...] (page_number는 1부터 시작)
         if not toc:
             self.bookmark_tree.hide()
-            self.bookmark_toggle_btn.setText("›")
+            self.bookmark_toggle_btn.hide()  # 북마크 정보가 아예 없으면 스위치 자체를 숨김
+            # 다음 번 다른(북마크 있는) 문서를 열 때를 위해 splitter도 접어둔 상태로 정리
+            if self.splitter.sizes()[0] != 0:
+                total = sum(self.splitter.sizes())
+                self.splitter.setSizes([0, total])
+                self._fixed_page_width = total
             return
 
         stack = []  # (level, QTreeWidgetItem)
@@ -664,6 +667,7 @@ class PDFClickPrinter(QMainWindow):
             stack.append((level, item))
         self.bookmark_tree.expandAll()
         self.bookmark_tree.show()
+        self.bookmark_toggle_btn.show()
         self.bookmark_toggle_btn.setText("‹")
         if self.splitter.sizes()[0] == 0:
             self.splitter.setSizes([220, self._fixed_page_width])
