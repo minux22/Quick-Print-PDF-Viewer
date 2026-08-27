@@ -30,18 +30,20 @@ import pymupdf as fitz  # PyMuPDF (오픈소스, MuPDF 기반)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QPushButton, QFileDialog, QSplitter, QTreeWidget, QTreeWidgetItem,
-    QScrollArea, QLineEdit, QShortcut, QScrollBar
+    QScrollArea, QLineEdit, QShortcut, QScrollBar, QButtonGroup
 )
 from PyQt5.QtGui import (
     QImage, QPixmap, QIntValidator, QKeySequence, QColor, QPainter, QPolygon,
     QPen, QLinearGradient, QRadialGradient, QBrush, QPainterPath
 )
-from PyQt5.QtCore import Qt, QSettings, QTimer, QPoint, QRectF
+from PyQt5.QtCore import Qt, QSettings, QTimer, QPoint, QRectF, QRect
 
 MIN_ZOOM = 1.0   # 1.0 = 페이지 맞춤 (더 이상 축소 불가)
 MAX_ZOOM = 5.0
 ZOOM_STEP = 1.15
 APP_TITLE = "Quick-Print PDF Viewer"
+MIN_PAGE_DISPLAY_WIDTH = 260  # Wide 모드에서 이 폭 밑으로는 페이지를 줄이지 않음(가독성 하한선)
+MAX_PAGES_IN_ROW_WIDE = 6      # Wide 모드: 화면이 아무리 넓어도 한 줄에 최대 이 장수까지만
 
 
 class PannableLabel(QLabel):
@@ -222,6 +224,11 @@ class PDFClickPrinter(QMainWindow):
         self.current_page = 0
         self._row_anchor = 0  # 여러 페이지가 나열될 때 줄의 시작 페이지(클릭 선택과 별개로 유지)
         self._page_regions = []  # 렌더링된 각 페이지의 클릭 판정 영역 [(page_idx, x_start, width), ...]
+        self.view_mode = "single"  # "single"(한 장) / "two"(두 쪽 스프레드) / "wide"(듀얼모니터 활용, 최대 6장)
+        self._pre_wide_mode = "single"  # Wide로 전환하기 직전의 모드 (ESC로 돌아갈 곳)
+        self._pre_wide_geometry = None  # Wide로 전환하기 전의 창 크기/위치
+        self._bookmark_saved_width = 220  # 북마크 패널을 껐다가 다시 켤 때 복원할 폭
+        self._mode_geometry = {"single": None, "two": None}  # 모드별로 마지막 창 크기/위치 기억
         self.setAcceptDrops(True)  # 창 위로 PDF 파일을 끌어다 놓으면 열리도록
         self.zoom = MIN_ZOOM
 
@@ -278,6 +285,40 @@ class PDFClickPrinter(QMainWindow):
         self.status_label = QLabel("PDF를 열어주세요")
         top_bar.addWidget(self.status_label)
         top_bar.addStretch()
+
+        mode_btn_style = """
+            QPushButton { padding: 2px 10px; font-weight: bold; }
+            QPushButton:checked {
+                background-color: #2F5496;
+                color: white;
+                border: 1px solid #2F5496;
+            }
+        """
+        self.single_mode_btn = QPushButton("Single")
+        self.single_mode_btn.setCheckable(True)
+        self.single_mode_btn.setChecked(True)
+        self.single_mode_btn.setStyleSheet(mode_btn_style)
+        self.single_mode_btn.clicked.connect(lambda: self.set_view_mode("single"))
+        top_bar.addWidget(self.single_mode_btn)
+
+        self.two_mode_btn = QPushButton("Two")
+        self.two_mode_btn.setCheckable(True)
+        self.two_mode_btn.setStyleSheet(mode_btn_style)
+        self.two_mode_btn.clicked.connect(lambda: self.set_view_mode("two"))
+        top_bar.addWidget(self.two_mode_btn)
+
+        self.wide_mode_btn = QPushButton("Wide")
+        self.wide_mode_btn.setCheckable(True)
+        self.wide_mode_btn.setStyleSheet(mode_btn_style)
+        self.wide_mode_btn.clicked.connect(lambda: self.set_view_mode("wide"))
+        top_bar.addWidget(self.wide_mode_btn)
+
+        self.mode_btn_group = QButtonGroup(self)
+        self.mode_btn_group.setExclusive(True)
+        self.mode_btn_group.addButton(self.single_mode_btn)
+        self.mode_btn_group.addButton(self.two_mode_btn)
+        self.mode_btn_group.addButton(self.wide_mode_btn)
+
         top_bar_widget = QWidget()
         top_bar_widget.setLayout(top_bar)
         top_bar_widget.setMaximumHeight(30)
@@ -296,11 +337,30 @@ class PDFClickPrinter(QMainWindow):
         self.page_area = PageScrollArea(self.on_wheel_zoom, self.on_wheel_page, on_page_click=self.on_page_click)
 
         # 오른쪽: 페이지 뷰 + 문서 전체 진행 표시줄(항상 보임, 드래그하면 해당 쪽으로 이동)
-        page_container = QWidget()
-        page_container_layout = QHBoxLayout(page_container)
+        self.page_container = QWidget()
+        page_container_layout = QHBoxLayout(self.page_container)
         page_container_layout.setContentsMargins(0, 0, 0, 0)
         page_container_layout.setSpacing(0)
         page_container_layout.addWidget(self.page_area, stretch=1)
+
+        # 북마크 패널 on/off 화살표 — page_container 왼쪽 가장자리에 떠 있는 작은 버튼
+        # (레이아웃에 넣지 않고 자유롭게 위치시켜서, 페이지 영역을 살짝 침범해도 무방하게 둔다)
+        self.bookmark_toggle_btn = QPushButton("‹", self.page_container)
+        self.bookmark_toggle_btn.setFixedSize(14, 44)
+        self.bookmark_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.bookmark_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 90);
+                color: white;
+                border: none;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: rgba(0, 0, 0, 150); }
+        """)
+        self.bookmark_toggle_btn.clicked.connect(self.toggle_bookmark_panel)
+        self.bookmark_toggle_btn.hide()  # 문서를 열기 전까지는 숨김
 
         self.page_progress_bar = QScrollBar(Qt.Vertical)
         self.page_progress_bar.setFixedWidth(10)
@@ -331,7 +391,7 @@ class PDFClickPrinter(QMainWindow):
         self.page_progress_bar.valueChanged.connect(self.on_progress_bar_changed)
         page_container_layout.addWidget(self.page_progress_bar)
 
-        self.splitter.addWidget(page_container)
+        self.splitter.addWidget(self.page_container)
 
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -374,9 +434,16 @@ class PDFClickPrinter(QMainWindow):
         if not self._adjusting_splitter and self.splitter.sizes()[1] > 0:
             # 사용자가 창 자체를 직접 리사이즈한 경우엔 PDF 뷰 폭 기준값을 갱신
             self._fixed_page_width = self.splitter.sizes()[1]
+        self._position_bookmark_toggle()
         if self.doc:
             # 크기 조절이 계속되는 동안은 다시 그리지 않고, 120ms간 조용하면 그때 한 번만 그림
             self._resize_render_timer.start(120)
+
+    def _position_bookmark_toggle(self):
+        btn = self.bookmark_toggle_btn
+        y = max(0, (self.page_container.height() - btn.height()) // 2)
+        btn.move(0, y)
+        btn.raise_()
 
     # ---------- 줌 ----------
     def on_wheel_zoom(self, direction: int):
@@ -389,11 +456,152 @@ class PDFClickPrinter(QMainWindow):
         self.render_current_page()
 
     def on_wheel_page(self, direction: int):
-        # 페이지 맞춤 상태에서 휠을 굴렸을 때: 위로 굴리면 이전 쪽, 아래로 굴리면 다음 쪽
+        # 페이지 맞춤 상태에서 휠을 굴렸을 때: 위로 굴리면 이전, 아래로 굴리면 다음.
+        # 여러 페이지가 한 번에 나열되어 있으면, 겹치지 않도록 그 장수만큼 건너뛴다.
+        step = len(self._page_regions) if len(self._page_regions) > 1 else 1
         if direction > 0:
-            self.prev_page()
+            self.jump_by(-step)
         else:
-            self.next_page()
+            self.jump_by(step)
+
+    def jump_by(self, delta: int):
+        if not self.doc:
+            return
+        self._navigate_to(self.current_page + delta)
+
+    def _two_mode_spread_start(self, idx: int) -> int:
+        """Two 모드에서 idx가 속한 스프레드의 시작 페이지(0-index)를 계산.
+        1쪽(idx=0)은 혼자 오른쪽에, 이후 (2,3),(4,5)... 짝수-홀수 순으로 묶여
+        홀수 쪽(1-index)이 항상 오른쪽에 오도록 한다."""
+        if idx <= 0:
+            return 0
+        return 1 + ((idx - 1) // 2) * 2
+
+    def _navigate_to(self, target: int):
+        if not self.doc:
+            return
+        target = max(0, min(target, len(self.doc) - 1))
+        if self.view_mode == "two":
+            self._row_anchor = self._two_mode_spread_start(target)
+            self.current_page = target  # 스프레드는 시작 기준으로, 선택은 실제 요청한 페이지로
+        else:
+            self.current_page = target
+            self._row_anchor = target
+        self.zoom = MIN_ZOOM
+        self.render_current_page()
+
+    def set_view_mode(self, mode: str):
+        if mode == self.view_mode:
+            return
+        old_mode = self.view_mode
+
+        # Single/Two를 떠날 때는 그 시점의 창 크기/위치를 그 모드의 '기억값'으로 저장해둔다
+        # (사용자가 그 모드에서 직접 리사이즈했다면, 그 마지막 값이 저장됨)
+        if old_mode in ("single", "two"):
+            self._mode_geometry[old_mode] = QRect(self.geometry())
+
+        if mode == "wide":
+            # Wide로 전환하기 직전 모드/창 크기를 기억해뒀다가, 나중에 돌아올 때 복원 (ESC 포함)
+            self._pre_wide_mode = old_mode
+            self._pre_wide_geometry = self.saveGeometry()
+            self.view_mode = mode
+            self._resize_to_span_monitors()
+        else:
+            self.view_mode = mode
+            if old_mode == "wide" and mode == self._pre_wide_mode and self._pre_wide_geometry is not None:
+                # Wide 진입 직전과 '같은' 모드로 돌아가는 경우에만 그 상태를 그대로 복원
+                self.restoreGeometry(self._pre_wide_geometry)
+                self._pre_wide_geometry = None
+                self._mode_geometry[mode] = QRect(self.geometry())
+            else:
+                if old_mode == "wide":
+                    # Wide에서 왔지만 진입 직전과 다른 모드로 바로 전환한 경우:
+                    # 저장해둔 pre-wide 상태는 이제 의미가 없으니 정리하고, 그 모드 고유의 기억값을 쓴다
+                    self._pre_wide_geometry = None
+                if self._mode_geometry.get(mode) is not None:
+                    # Single↔Two 직접 전환: 그 모드에서 마지막으로 쓰던 크기/위치를 복원
+                    self.setGeometry(self._mode_geometry[mode])
+                elif mode == "two":
+                    # Two를 한 번도 쓴 적 없으면: Single 폭의 2배로 기본값 계산
+                    self._apply_default_two_geometry()
+
+        # 버튼 체크 상태를 실제 모드와 맞춤 (ESC 등 버튼 클릭이 아닌 경로로 전환된 경우 대비)
+        {"single": self.single_mode_btn, "two": self.two_mode_btn, "wide": self.wide_mode_btn}[mode].setChecked(True)
+
+        self._row_anchor = self.current_page
+        self.zoom = MIN_ZOOM
+        if self.doc:
+            # 특히 Wide 전환 시 창을 두 모니터에 걸치도록 리사이즈하는데, 그 처리가 완전히
+            # 끝나기 전에 바로 그리면 아직 옛 크기 기준이라 모니터2쪽이 비어 보일 수 있다.
+            # 다음 이벤트 루프로 미뤄서 리사이즈가 확정된 뒤에 그리도록 하고,
+            # Wide는 창 관리자 협상이 더 걸릴 수 있어 안전하게 한 번 더 재확인한다.
+            QTimer.singleShot(0, self.render_current_page)
+            if mode == "wide":
+                QTimer.singleShot(120, self.render_current_page)
+
+    def _apply_default_two_geometry(self):
+        """Two 모드를 아직 한 번도 안 써서 기억된 크기가 없을 때: Single 폭의 2배로 확장.
+        기본은 오른쪽으로 늘리되, 그러면 모니터 오른쪽 경계를 넘는 경우엔 왼쪽으로 확장한다."""
+        base = self._mode_geometry.get("single") or self.geometry()
+        new_width = base.width() * 2
+
+        screen = self.screen() if hasattr(self, "screen") else None
+        screen = screen or QApplication.primaryScreen()
+        new_x = base.x()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            right_edge = avail.x() + avail.width()
+            if new_x + new_width > right_edge:
+                new_x = max(avail.x(), right_edge - new_width)
+
+        new_rect = QRect(new_x, base.y(), new_width, base.height())
+        self.setGeometry(new_rect)
+        self._mode_geometry["two"] = QRect(new_rect)
+
+    def _resize_to_span_monitors(self):
+        screens = QApplication.screens()
+        if len(screens) < 2:
+            return  # 모니터가 하나뿐이면 굳이 손대지 않음
+        combined = QRect()
+        for s in screens:
+            combined = combined.united(s.geometry())
+        self.setGeometry(combined)
+
+    def _get_monitor_seams_in_viewport(self):
+        """페이지 뷰 영역(page_area 뷰포트) 좌표계 기준으로, 모니터와 모니터 사이 경계가 되는
+        x좌표 목록을 반환한다. Wide 모드에서 페이지가 이 경계에 걸쳐 잘려 보이는 걸 막기 위함."""
+        screens = QApplication.screens()
+        if len(screens) < 2:
+            return []
+        origin_x = self.page_area.viewport().mapToGlobal(QPoint(0, 0)).x()
+        sorted_screens = sorted(screens, key=lambda s: s.geometry().x())
+        seams = []
+        for s in sorted_screens[1:]:
+            seam_x = s.geometry().x() - origin_x
+            if seam_x > 0:
+                seams.append(seam_x)
+        return seams
+
+    def toggle_bookmark_panel(self):
+        if self.bookmark_tree.isVisible():
+            current_width = self.splitter.sizes()[0]
+            if current_width > 0:
+                self._bookmark_saved_width = current_width
+            self.bookmark_tree.hide()
+            total = sum(self.splitter.sizes())
+            self.splitter.setSizes([0, total])
+            self._fixed_page_width = total
+            self.bookmark_toggle_btn.setText("›")
+        else:
+            self.bookmark_tree.show()
+            total = sum(self.splitter.sizes())
+            bw = min(self._bookmark_saved_width, max(total - 100, 0))
+            self.splitter.setSizes([bw, total - bw])
+            self._fixed_page_width = total - bw
+            self.bookmark_toggle_btn.setText("‹")
+        self._position_bookmark_toggle()
+        if self.doc:
+            QTimer.singleShot(0, self.render_current_page)
 
     # ---------- 파일 열기 / 북마크 ----------
     def set_nav_enabled(self, enabled: bool):
@@ -427,6 +635,9 @@ class PDFClickPrinter(QMainWindow):
         self.zoom = MIN_ZOOM
         self.set_nav_enabled(True)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
+        self.bookmark_toggle_btn.show()
+        self.bookmark_toggle_btn.setText("‹")
+        self._position_bookmark_toggle()
         self.load_bookmarks()
         # 북마크 패널이 새로 나타나거나 사라지면서 스플리터 레이아웃이 바뀔 수 있으므로,
         # 그 레이아웃이 확정된 뒤에 렌더링해야 뷰 폭을 정확히 계산해 스크롤이 생기지 않는다.
@@ -437,6 +648,7 @@ class PDFClickPrinter(QMainWindow):
         toc = self.doc.get_toc()  # [[level, title, page_number], ...] (page_number는 1부터 시작)
         if not toc:
             self.bookmark_tree.hide()
+            self.bookmark_toggle_btn.setText("›")
             return
 
         stack = []  # (level, QTreeWidgetItem)
@@ -452,18 +664,15 @@ class PDFClickPrinter(QMainWindow):
             stack.append((level, item))
         self.bookmark_tree.expandAll()
         self.bookmark_tree.show()
+        self.bookmark_toggle_btn.setText("‹")
         if self.splitter.sizes()[0] == 0:
             self.splitter.setSizes([220, self._fixed_page_width])
 
     def jump_to_bookmark(self, item, column):
         page_number = item.data(0, Qt.UserRole)
-        if page_number is None or not self.doc:
+        if page_number is None:
             return
-        target = max(0, min(page_number - 1, len(self.doc) - 1))
-        self.current_page = target
-        self._row_anchor = target
-        self.zoom = MIN_ZOOM
-        self.render_current_page()
+        self._navigate_to(page_number - 1)
 
     def go_to_page_from_input(self):
         if not self.doc:
@@ -471,14 +680,67 @@ class PDFClickPrinter(QMainWindow):
         text = self.page_input.text().strip()
         if not text:
             return
-        target = max(1, min(int(text), len(self.doc))) - 1
-        self.current_page = target
-        self._row_anchor = target
-        self.zoom = MIN_ZOOM
-        self.render_current_page()
+        self._navigate_to(int(text) - 1)
         self.page_input.clear()
 
     # ---------- 렌더링 ----------
+    def _composite_row(self, slots, vw, vh, margin, gap, left_align, seams=None):
+        """slots: [(page_idx_or_None, QImage_or_None, w, h), ...] 를 한 줄로 이어 그린 합성 이미지와
+        클릭 판정 영역 목록을 반환. page_idx가 None인 슬롯은 빈 칸(Two 모드의 1쪽 왼쪽 공백)으로,
+        이미지도 클릭 영역도 만들지 않는다.
+        seams가 주어지면(Wide 모드 + 듀얼모니터), 어떤 페이지가 모니터 경계에 걸쳐 잘려 보일 것 같으면
+        그 페이지를 통째로 다음 모니터 시작 위치로 밀어서 배치한다 — 걸치는 페이지 없음을 보장."""
+        avail_w = max(vw - margin * 2, 10)
+        total_content_w = sum(w for _, _, w, _ in slots) + gap * (len(slots) - 1)
+
+        if left_align:
+            start_x = margin
+        else:
+            start_x = margin + max(0, (avail_w - total_content_w) // 2)
+
+        composite = QImage(vw, vh, QImage.Format_RGB888)
+        composite.fill(QColor("#757575"))
+        painter = QPainter(composite)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        regions = []
+        drawn = []  # (page_idx, im, w, h, x) — 실제로 그려진 것만
+        x = start_x
+        for page_idx, im, w, h in slots:
+            if seams:
+                for seam in seams:
+                    if x < seam < x + w:
+                        x = seam  # 경계에 걸치지 않도록 다음 모니터 시작 위치로 통째로 밀기
+                        break
+            if x + w > vw - margin:
+                break  # 남은 공간에 안 들어가면 이후 페이지는 그리지 않음
+            if im is not None:
+                painter.drawImage(x, margin, im)
+                regions.append((page_idx, x, w))
+            drawn.append((page_idx, im, w, h, x))
+            x += w + gap
+
+        # 선택된(현재) 페이지: 두툼한 파란색 둥근 테두리
+        border_width = 6
+        border_radius = 10
+        accent = QColor("#5C8AE0")  # 로고와 같은 계열의 파란색
+        for page_idx, im, w, h, sx in drawn:
+            if page_idx is not None and page_idx == self.current_page:
+                pen = QPen(accent, border_width)
+                pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                rect = QRectF(
+                    sx - border_width / 2 - 1,
+                    margin - border_width / 2 - 1,
+                    w + border_width + 2,
+                    h + border_width + 2,
+                )
+                painter.drawRoundedRect(rect, border_radius, border_radius)
+
+        painter.end()
+        return composite, regions
+
     def render_current_page(self):
         if not self.doc:
             return
@@ -501,32 +763,85 @@ class PDFClickPrinter(QMainWindow):
             pix = target_page.get_pixmap(matrix=fitz.Matrix(final_scale, final_scale))
             img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
         else:
-            # 페이지 맞춤(최대 축소) 상태: _row_anchor부터 세로 높이에 맞춰 옆으로 몇 장이나
-            # 들어가는지 계산해서 이어 붙인다. 창이 좁으면 자연히 한 장만 표시된다.
-            anchor_page = self.doc[self._row_anchor]
-            anchor_w_pt, anchor_h_pt = anchor_page.rect.width, anchor_page.rect.height
-
-            # 페이지들을 담을 실제 여백(margin)을 미리 확보해서, 합성 이미지가 뷰 영역을
-            # 절대 넘지 않도록 한다 — 넘치면 스크롤 가능 상태로 오인되어 휠/클릭 동작이 꼬인다.
             margin = 9
             avail_h = max(vh - margin * 2, 10)
             avail_w = max(vw - margin * 2, 10)
-            scale = avail_h / max(anchor_h_pt, 0.01)
-            disp_w_at_scale = anchor_w_pt * scale
+            gap = 10
 
-            if disp_w_at_scale > avail_w:
-                # 한 장조차 폭에 안 맞는 경우(좁은 창/세로로 긴 페이지) → 기존처럼 한 장만, 폭/높이 둘 다 맞춤
+            if self.view_mode == "single":
+                # 항상 정확히 한 장만, 폭/높이 모두 맞춤
                 self._row_anchor = self.current_page
                 fit_scale = min(vw / page_w_pt, vh / page_h_pt)
                 pix = target_page.get_pixmap(matrix=fitz.Matrix(fit_scale, fit_scale))
                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
                 self._page_regions = [(self.current_page, 0, img.width())]
-            else:
-                gap = 10
+
+            elif self.view_mode == "two":
+                # 두 쪽 스프레드: 1쪽은 혼자 오른쪽에(왼쪽은 빈 칸), 이후 (2,3)(4,5)... 순으로
+                # 짝-홀 페이지가 묶여 홀수 쪽이 항상 오른쪽에 오도록 한다(일반적인 책 펼침 방식).
+                spread_start = self._two_mode_spread_start(self._row_anchor)
+                self._row_anchor = spread_start
+                if spread_start == 0:
+                    real_indices = [0]
+                    has_blank_left = True
+                elif spread_start + 1 < len(self.doc):
+                    real_indices = [spread_start, spread_start + 1]
+                    has_blank_left = False
+                else:
+                    real_indices = [spread_start]  # 마지막 쪽이 짝을 못 찾는 경우 혼자 표시
+                    has_blank_left = False
+
+                if self.current_page not in real_indices:
+                    self.current_page = spread_start
+
+                ref_page = self.doc[real_indices[0]]
+                rw_pt, rh_pt = ref_page.rect.width, ref_page.rect.height
+                slot_count = len(real_indices) + (1 if has_blank_left else 0)
+                max_scale_by_height = avail_h / max(rh_pt, 0.01)
+                total_gap = gap * (slot_count - 1)
+                rounding_slack = slot_count * 2
+                scale_by_width = (avail_w - total_gap - rounding_slack) / max(slot_count * rw_pt, 0.01)
+                scale = max(min(max_scale_by_height, scale_by_width), 0.01)
+
+                slots = []  # (page_idx_or_None, QImage_or_None, w, h)
+                if has_blank_left:
+                    slots.append((None, None, int(rw_pt * scale), int(rh_pt * scale)))
+                for idx in real_indices:
+                    p = self.doc[idx]
+                    pix = p.get_pixmap(matrix=fitz.Matrix(scale, scale))
+                    pimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+                    slots.append((idx, pimg, pimg.width(), pimg.height()))
+
+                img, self._page_regions = self._composite_row(
+                    slots, vw, vh, margin, gap, left_align=False
+                )
+
+            else:  # "wide"
+                anchor_page = self.doc[self._row_anchor]
+                anchor_w_pt, anchor_h_pt = anchor_page.rect.width, anchor_page.rect.height
+                max_scale_by_height = avail_h / max(anchor_h_pt, 0.01)
+
+                # 세로 높이를 꽉 채우는 크기만 고집하면, 듀얼모니터처럼 가로만 넓은 화면에서는
+                # 페이지 자체가 (세로 기준으로) 이미 커서 몇 장 못 들어간다. 그래서 가로 공간이
+                # 넉넉하면 최소 가독 폭(MIN_PAGE_DISPLAY_WIDTH) 안에서 페이지를 살짝 줄여서라도
+                # 더 많은 장수(최대 MAX_PAGES_IN_ROW_WIDE)가 들어가도록 배율을 정한다.
+                max_pages_available = min(len(self.doc) - self._row_anchor, MAX_PAGES_IN_ROW_WIDE)
+                scale = max_scale_by_height
+                for n in range(max_pages_available, 0, -1):
+                    total_gap = gap * (n - 1)
+                    if avail_w - total_gap <= 0:
+                        continue
+                    rounding_slack = n * 2  # 페이지별 픽셀 반올림 오차를 감안한 여유
+                    scale_for_n = (avail_w - total_gap - rounding_slack) / (n * anchor_w_pt)
+                    candidate_scale = min(scale_for_n, max_scale_by_height)
+                    if candidate_scale * anchor_w_pt >= MIN_PAGE_DISPLAY_WIDTH or n == 1:
+                        scale = candidate_scale
+                        break
+
                 shown = []  # (page_idx, QImage, disp_w)
                 total_w = 0
                 idx = self._row_anchor
-                while idx < len(self.doc) and len(shown) < 12:
+                while idx < len(self.doc) and len(shown) < max_pages_available:
                     p = self.doc[idx]
                     pw_pt, ph_pt = p.rect.width, p.rect.height
                     if pw_pt <= 0 or ph_pt <= 0:
@@ -546,49 +861,12 @@ class PDFClickPrinter(QMainWindow):
                     # 선택된 페이지가 화면에서 벗어났으면(리사이즈 등) 줄의 시작 페이지로 선택을 되돌림
                     self.current_page = self._row_anchor
 
-                if len(shown) <= 1:
-                    only_idx, only_img, only_w = shown[0]
-                    img = only_img
-                    self._page_regions = [(only_idx, 0, only_w)]
-                else:
-                    border_width = 6
-                    border_radius = 10
-                    accent = QColor("#5C8AE0")  # 로고와 같은 계열의 파란색
-
-                    total_content_w = sum(w for _, _, w in shown) + gap * (len(shown) - 1)
-                    start_x = margin + max(0, (avail_w - total_content_w) // 2)
-
-                    # 캔버스를 뷰 영역 크기에 정확히 맞춤(vw x vh) — 절대 넘치지 않게
-                    composite = QImage(vw, vh, QImage.Format_RGB888)
-                    composite.fill(QColor("#757575"))
-                    painter = QPainter(composite)
-                    painter.setRenderHint(QPainter.Antialiasing)
-
-                    x = start_x
-                    for page_idx, im, w in shown:
-                        painter.drawImage(x, margin, im)
-                        self._page_regions.append((page_idx, x, w))
-                        x += w + gap
-
-                    # 선택된 페이지: 두툼한 파란색 둥근 테두리
-                    x = start_x
-                    for page_idx, im, w in shown:
-                        if page_idx == self.current_page:
-                            pen = QPen(accent, border_width)
-                            pen.setJoinStyle(Qt.RoundJoin)
-                            painter.setPen(pen)
-                            painter.setBrush(Qt.NoBrush)
-                            rect = QRectF(
-                                x - border_width / 2 - 1,
-                                margin - border_width / 2 - 1,
-                                w + border_width + 2,
-                                im.height() + border_width + 2,
-                            )
-                            painter.drawRoundedRect(rect, border_radius, border_radius)
-                        x += w + gap
-
-                    painter.end()
-                    img = composite
+                # 화면이 아무리 넓어도, 보여줄 페이지가 적으면 가운데 대신 왼쪽부터 채운다
+                slots = [(idx, im, w, im.height()) for idx, im, w in shown]
+                seams = self._get_monitor_seams_in_viewport()
+                img, self._page_regions = self._composite_row(
+                    slots, vw, vh, margin, gap, left_align=True, seams=seams
+                )
 
         if img is None:
             return
@@ -615,15 +893,7 @@ class PDFClickPrinter(QMainWindow):
 
     def on_progress_bar_changed(self, value: int):
         # 사용자가 오른쪽 진행 표시줄을 드래그/클릭했을 때 — 해당 쪽으로 바로 이동
-        if not self.doc:
-            return
-        target = value - 1
-        if target == self.current_page:
-            return
-        self.current_page = target
-        self._row_anchor = target
-        self.zoom = MIN_ZOOM
-        self.render_current_page()
+        self._navigate_to(value - 1)
 
     def on_page_click(self, x: int, y: int):
         # 여러 페이지가 나열된 상태에서 클릭한 위치가 어느 페이지인지 찾아 선택(=현재 페이지)을 바꾼다.
@@ -637,18 +907,13 @@ class PDFClickPrinter(QMainWindow):
                 return
 
     def prev_page(self):
-        if self.doc and self.current_page > 0:
-            self.current_page -= 1
-            self._row_anchor = self.current_page
-            self.zoom = MIN_ZOOM
-            self.render_current_page()
+        # 여러 페이지가 한 번에 보이는 상태라면, 겹치지 않도록 보이는 장수만큼 한 번에 넘긴다
+        step = len(self._page_regions) if len(self._page_regions) > 1 else 1
+        self.jump_by(-step)
 
     def next_page(self):
-        if self.doc and self.current_page < len(self.doc) - 1:
-            self.current_page += 1
-            self._row_anchor = self.current_page
-            self.zoom = MIN_ZOOM
-            self.render_current_page()
+        step = len(self._page_regions) if len(self._page_regions) > 1 else 1
+        self.jump_by(step)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Left, Qt.Key_PageUp):
@@ -657,6 +922,8 @@ class PDFClickPrinter(QMainWindow):
             self.next_page()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.print_current_page()
+        elif event.key() == Qt.Key_Escape and self.view_mode == "wide":
+            self.set_view_mode(self._pre_wide_mode)
         else:
             super().keyPressEvent(event)
 
